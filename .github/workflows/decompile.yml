@@ -73,9 +73,25 @@ jobs:
       - name: Install ilspycmd
         shell: pwsh
         run: |
-          dotnet tool install -g ilspycmd 2>&1 | Tee-Object -FilePath logs/06-ilspycmd-install.txt
-          "$env:USERPROFILE\.dotnet\tools" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-          & "$env:USERPROFILE\.dotnet\tools\ilspycmd.exe" --version 2>&1 | Tee-Object -FilePath logs/06-ilspycmd-install.txt -Append
+          # The --version call below is only a sanity check. It must not fail the step,
+          # because the real test is the decompile step. Everything is logged for diagnosis.
+          $log = "logs/06-ilspycmd-install.txt"
+          dotnet tool install -g ilspycmd 2>&1 | Tee-Object -FilePath $log
+          $tools = "$env:USERPROFILE\.dotnet\tools"
+          $tools | Out-File -Append -Encoding utf8 $env:GITHUB_PATH   # for later steps
+          $env:PATH += ";$tools"                                       # for this step
+          "--- tools dir ($tools) ---" | Tee-Object -FilePath $log -Append
+          Get-ChildItem $tools -ErrorAction SilentlyContinue | Out-String | Tee-Object -FilePath $log -Append
+          "--- installed runtimes ---" | Tee-Object -FilePath $log -Append
+          dotnet --list-runtimes 2>&1 | Tee-Object -FilePath $log -Append
+          "--- ilspycmd --version ---" | Tee-Object -FilePath $log -Append
+          try {
+            ilspycmd --version 2>&1 | Tee-Object -FilePath $log -Append
+            "version exit code: $LASTEXITCODE" | Tee-Object -FilePath $log -Append
+          } catch {
+            "version check threw: $($_.Exception.Message)" | Tee-Object -FilePath $log -Append
+          }
+          exit 0
 
       # ---------- STEP 4 (partial): can the runner reach the download hosts? ----------
       - name: Network reachability check
