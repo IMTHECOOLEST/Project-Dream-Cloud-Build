@@ -1,0 +1,99 @@
+name: Check Contents download
+
+# Standalone check that the Contents zip can be fetched from the link stored in the repo secrets.
+# Once it passes, copy the three steps below ("Fetch" through "Locate") into the build job unchanged;
+# they export CONTENTS_DIR for the build step.
+#
+# Repo secrets (Settings > Secrets and variables > Actions > New repository secret):
+#   CONTENTS_URL     required. Direct download link to the Contents zip (the link must download the file itself,
+#                    not an HTML preview page). The value is masked in the logs.
+#   CONTENTS_SHA256  optional. If set, the download must match it; if not set, the hash is only printed.
+#
+# Use a PRIVATE repo: this handles a commercial game's files and the build publishes its APK/OBB.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check-contents:
+    runs-on: windows-2022
+    steps:
+      - name: Fetch Contents zip from secret URL
+        shell: pwsh
+        env:
+          CONTENTS_URL: ${{ secrets.CONTENTS_URL }}
+          CONTENTS_SHA256: ${{ secrets.CONTENTS_SHA256 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CONTENTS_URL)) { throw "Secret CONTENTS_URL is not set" }
+          $zip = Join-Path $PWD "contents.zip"
+
+          # Free space on the workspace drive before downloading.
+          $drive = (Get-Item $PWD).PSDriveName
+          $free = (Get-PSDrive $drive).Free
+          "Workspace drive ${drive}: free = $([math]::Round($free/1GB,2)) GB"
+
+          curl.exe -L --fail --retry 5 --retry-delay 10 --silent --show-error -o $zip $env:CONTENTS_URL
+          if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE (link not direct, expired, or blocked)" }
+
+          $len = (Get-Item $zip).Length
+          "Downloaded: $len bytes ($([math]::Round($len/1GB,2)) GB)"
+
+          # Must really be a zip (starts with 'PK'), not an HTML page from the hosting service.
+          $fs = [System.IO.File]::OpenRead($zip); $b = New-Object byte[] 2; [void]$fs.Read($b, 0, 2); $fs.Close()
+          if ($b[0] -ne 0x50 -or $b[1] -ne 0x4B) { throw "Downloaded file is not a zip (first bytes: $($b[0]),$($b[1])). The link is probably a web page, not a direct download." }
+
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "SHA-256: $sha"
+          if (-not [string]::IsNullOrWhiteSpace($env:CONTENTS_SHA256)) {
+            if ($sha -ne $env:CONTENTS_SHA256.Trim().ToLower()) { throw "SHA-256 does not match CONTENTS_SHA256 - stopping" }
+            "Matches CONTENTS_SHA256"
+          } else { "CONTENTS_SHA256 not set - hash printed only" }
+
+          # Room for the extraction plus the 3 GB the README asks for AndroidTools (my sanity margin).
+          $needed = 2 * $len + 3GB
+          if ($free -lt $needed) { throw "Not enough free space: need about $([math]::Round($needed/1GB,2)) GB, have $([math]::Round($free/1GB,2)) GB" }
+
+      - name: Extract
+        shell: pwsh
+        run: |
+          $zip = Join-Path $PWD "contents.zip"
+          $dest = Join-Path $PWD "contents_extracted"
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+          if (Test-Path $7z) {
+            & $7z x $zip "-o$dest" -y -bso0 -bsp0
+            if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
+          } else {
+            Expand-Archive $zip -DestinationPath $dest -Force
+          }
+          Remove-Item $zip   # free the space
+          "Top level of the extracted zip:"
+          Get-ChildItem $dest | Select-Object Mode, Name | Format-Table | Out-String
+
+      - name: Locate the Contents folder
+        shell: pwsh
+        run: |
+          $root = Join-Path $PWD "contents_extracted"
+          function Test-IsContents($d) { (Test-Path (Join-Path $d "Info.plist")) -and (Test-Path (Join-Path $d "MacOS")) }
+
+          if (Test-IsContents $root) { $found = @(Get-Item $root) }
+          else {
+            $found = @(Get-ChildItem $root -Recurse -Directory -Filter Contents |
+              Where-Object { $_.FullName -notmatch '__MACOSX' -and (Test-IsContents $_.FullName) })
+          }
+          if ($found.Count -ne 1) {
+            "Candidates found: $($found.Count)"
+            $found | ForEach-Object { $_.FullName }
+            Get-ChildItem $root -Recurse -Depth 2 | Select-Object -First 80 FullName | Format-Table -AutoSize | Out-String -Width 300
+            throw "Expected exactly one Contents folder (with Info.plist and MacOS) - stopping"
+          }
+          $contents = $found[0].FullName
+          "CONTENTS_DIR=$contents" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "Contents folder: $contents"
+          Get-ChildItem $contents | Select-Object Mode, Name | Format-Table | Out-String
+
+          # Version check (README: only tested on 1.10.1). Warn only; the plist may be binary.
+          $plist = Get-Content (Join-Path $contents "Info.plist") -Raw -ErrorAction SilentlyContinue
+          if ($plist -match 'CFBundleShortVersionString</key>\s*<string>([^<]+)</string>') {
+            "CFBundleShortVersionString = $($Matches[1])"
+            if ($Matches[1] -ne "1.10.1") { "WARNING: README says only 1.10.1 was tested" }
+          } else { "Could not read the version from Info.plist (it may be a binary plist)" }
