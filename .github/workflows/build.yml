@@ -1,0 +1,676 @@
+name: Project Dream - build (Windows / Android)
+
+# Builds the game from the macOS Contents folder using Project_Dream.exe's own build engine.
+# Run it from the Actions tab > "Project Dream - build (Windows / Android)" > Run workflow,
+# then pick the platform (android or windows).
+#
+# How it works
+#   Project_Dream.exe is a GUI-only app with no command-line mode. Its Build button just calls
+#   BuildEngine.Run(contentsFolder, android) on a worker thread. This workflow compiles a tiny console
+#   harness (PDHarness.exe) that loads the exe and makes the same call, so the build runs headless.
+#   Nothing in the exe is modified.
+#
+# Android dependencies (fetched and SHA-256 verified by the exe's own installer, list embedded in the exe):
+#   Android NDK r23b, Android SDK build-tools 34.0.0, Android SDK platform android-34,
+#   OpenJDK 17 (Temurin 17.0.16+8) and Unity's Android player for 2022.3.54f1.
+#   2022.3.54f1 must stay exact: the game is that Unity version, the exe refuses any other, and the
+#   Android player is binary-patched at fixed offsets. A "close" Unity version would not be playable.
+#
+# Repo secrets (Settings > Secrets and variables > Actions):
+#   CONTENTS_URL            required. Direct download link to the Contents zip. Masked in the logs.
+#   CONTENTS_SHA256         optional. If set, the download must match it.
+#   ANDROID_KEYSTORE_BASE64 optional. Base64 of your own signing keystore (alias "sdt", store and key
+#                           password "sdtandroid"). If not set, the build creates a key once and keeps it
+#                           in the Actions cache, so later APKs can be installed over earlier ones.
+#
+# Use a PRIVATE repo: this handles a commercial game's files and the build publishes its APK/OBB.
+# Artifact storage counts against your quota (500 MB on free plans); lower "retention_days" if needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "What to build"
+        type: choice
+        required: true
+        default: android
+        options:
+          - android
+          - windows
+      retention_days:
+        description: "Days to keep the build artifact"
+        type: number
+        required: false
+        default: 3
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ inputs.platform }})
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      PD_PLATFORM: ${{ inputs.platform }}
+      PD_TOOL_DIR: C:\pdtool
+      PD_EXE_SHA256: b2947bd61e86b067e7264888d64dd704972e901210f42c6bc7a0c5260a070101
+      PD_EXE_SIZE: "80336384"
+      HAS_KEYSTORE_SECRET: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Private repository check
+        shell: pwsh
+        run: |
+          if ("${{ github.event.repository.private }}" -ne "true") {
+            "::warning title=Public repository::This repo is public. The build artifact contains a commercial game's converted files and public-repo artifacts can be downloaded by anyone signed in to GitHub. Use a private repo."
+          } else { "Repository is private." }
+
+      - name: Runner info
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force logs | Out-Null
+          (Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, FreePhysicalMemory | Format-List | Out-String) | Tee-Object -FilePath logs/00-runner.txt
+          Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | ForEach-Object { "{0}: free {1:N1} GB" -f $_.Name, ($_.Free / 1GB) } | Tee-Object -FilePath logs/00-runner.txt -Append
+          "Building: $env:PD_PLATFORM" | Tee-Object -FilePath logs/00-runner.txt -Append
+
+      # ---------- Project_Dream.exe: reassemble, stage on C:, verify ----------
+      - name: Install Info-ZIP
+        shell: pwsh
+        run: choco install zip -y 2>&1 | Tee-Object -FilePath logs/01-choco-zip.txt
+
+      - name: Reassemble split zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force work | Out-Null
+          Get-ChildItem ezyZip.* | Select-Object Name, Length | Format-Table | Out-String | Tee-Object -FilePath logs/02-parts.txt
+          Copy-Item ezyZip.z0*, ezyZip.zip work/
+          Set-Location work
+          zip -s 0 ezyZip.zip --out EzyZip_combined.zip 2>&1 | Tee-Object -FilePath ../logs/02-combine.txt -Append
+          if ($LASTEXITCODE -ne 0) { throw "zip -s 0 failed with exit code $LASTEXITCODE" }
+          Expand-Archive EzyZip_combined.zip -DestinationPath combined -Force
+          Expand-Archive "combined/untitled folder.zip" -DestinationPath inner -Force
+          Get-ChildItem inner -Recurse -File | Where-Object { $_.FullName -notmatch '__MACOSX' } | Select-Object FullName, Length | Format-Table -AutoSize | Out-String -Width 300 | Tee-Object -FilePath ../logs/02-combine.txt -Append
+
+      # The exe is staged on C: (not the D: workspace): the Android tools (several GB) and the converted
+      # assets are written next to the exe, and C: has far more free space than D:.
+      - name: Stage Project_Dream.exe and verify SHA-256
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:PD_TOOL_DIR | Out-Null
+          $src = "work/inner/untitled folder/Project_Dream.exe"
+          if (-not (Test-Path $src)) { throw "Project_Dream.exe was not found after reassembling" }
+          $exe = Join-Path $env:PD_TOOL_DIR "Project_Dream.exe"
+          Copy-Item $src $exe -Force
+          $item = Get-Item $exe
+          $actual = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "size:     $($item.Length) bytes (expected $env:PD_EXE_SIZE)" | Tee-Object -FilePath logs/03-hash.txt
+          "expected: $env:PD_EXE_SHA256" | Tee-Object -FilePath logs/03-hash.txt -Append
+          "actual:   $actual" | Tee-Object -FilePath logs/03-hash.txt -Append
+          if ("$($item.Length)" -ne $env:PD_EXE_SIZE) { throw "Project_Dream.exe has the wrong size - stopping" }
+          if ($actual -ne $env:PD_EXE_SHA256) { throw "SHA-256 MISMATCH - stopping" }
+          "HASH OK" | Tee-Object -FilePath logs/03-hash.txt -Append
+
+      - name: Check .NET Framework 4.8 (registry Release >= 528040)
+        shell: pwsh
+        run: |
+          $rel = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full').Release
+          "Release value: $rel (need >= 528040)" | Tee-Object -FilePath logs/04-netfx48.txt
+          if ($rel -lt 528040) { throw ".NET Framework 4.8 not present - stopping" }
+          ".NET Framework 4.8 present" | Tee-Object -FilePath logs/04-netfx48.txt -Append
+
+      # ---------- Game files (proven steps, unchanged) ----------
+      - name: Fetch Contents zip from secret URL
+        shell: pwsh
+        env:
+          CONTENTS_URL: ${{ secrets.CONTENTS_URL }}
+          CONTENTS_SHA256: ${{ secrets.CONTENTS_SHA256 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CONTENTS_URL)) { throw "Secret CONTENTS_URL is not set" }
+          $zip = Join-Path $PWD "contents.zip"
+
+          # Free space on the workspace drive before downloading.
+          # (Get-Item $PWD).PSDriveName is always null (that property doesn't exist), which is what broke
+          # the previous run. DriveInfo on the path root doesn't depend on PowerShell drives at all.
+          $driveRoot = [System.IO.Path]::GetPathRoot($PWD.Path)
+          $free = [System.IO.DriveInfo]::new($driveRoot).AvailableFreeSpace
+          "Workspace drive ${driveRoot} free = $([math]::Round($free/1GB,2)) GB"
+
+          curl.exe -L --fail --retry 5 --retry-delay 10 --silent --show-error -o $zip $env:CONTENTS_URL
+          if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE (link not direct, expired, or blocked)" }
+
+          $len = (Get-Item $zip).Length
+          "Downloaded: $len bytes ($([math]::Round($len/1GB,2)) GB)"
+
+          # Must really be a zip (starts with 'PK'), not an HTML page from the hosting service.
+          $fs = [System.IO.File]::OpenRead($zip); $b = New-Object byte[] 2; [void]$fs.Read($b, 0, 2); $fs.Close()
+          if ($b[0] -ne 0x50 -or $b[1] -ne 0x4B) { throw "Downloaded file is not a zip (first bytes: $($b[0]),$($b[1])). The link is probably a web page, not a direct download." }
+
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "SHA-256: $sha"
+          if (-not [string]::IsNullOrWhiteSpace($env:CONTENTS_SHA256)) {
+            if ($sha -ne $env:CONTENTS_SHA256.Trim().ToLower()) { throw "SHA-256 does not match CONTENTS_SHA256 - stopping" }
+            "Matches CONTENTS_SHA256"
+          } else { "CONTENTS_SHA256 not set - hash printed only" }
+
+          # Room for the extraction plus the 3 GB the README asks for AndroidTools (my sanity margin).
+          $needed = 2 * $len + 3GB
+          if ($free -lt $needed) { throw "Not enough free space: need about $([math]::Round($needed/1GB,2)) GB, have $([math]::Round($free/1GB,2)) GB" }
+
+      - name: Extract
+        shell: pwsh
+        run: |
+          $zip = Join-Path $PWD "contents.zip"
+          $dest = Join-Path $PWD "contents_extracted"
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+          if (Test-Path $7z) {
+            & $7z x $zip "-o$dest" -y -bso0 -bsp0
+            if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
+          } else {
+            Expand-Archive $zip -DestinationPath $dest -Force
+          }
+          Remove-Item $zip   # free the space
+          "Top level of the extracted zip:"
+          Get-ChildItem $dest | Select-Object Mode, Name | Format-Table | Out-String
+
+      - name: Locate the Contents folder
+        shell: pwsh
+        run: |
+          $root = Join-Path $PWD "contents_extracted"
+          function Test-IsContents($d) { (Test-Path (Join-Path $d "Info.plist")) -and (Test-Path (Join-Path $d "MacOS")) }
+
+          if (Test-IsContents $root) { $found = @(Get-Item $root) }
+          else {
+            $all = @(Get-ChildItem $root -Recurse -Directory -Filter Contents |
+              Where-Object { $_.FullName -notmatch '__MACOSX' -and (Test-IsContents $_.FullName) })
+
+            # Unity plugin bundles (PlugIns\*.bundle) and any helper apps have their own Contents folder with
+            # Info.plist + MacOS, so they look like candidates too. That is what broke the previous run
+            # (more than one match). Keep only the outermost: drop any candidate that sits inside another one.
+            $found = @($all | Where-Object {
+              $p = $_.FullName
+              -not ($all | Where-Object { $_.FullName -ne $p -and $p.StartsWith($_.FullName + '\', [System.StringComparison]::OrdinalIgnoreCase) })
+            })
+            "All Contents-like folders: $($all.Count); outermost: $($found.Count)"
+          }
+          if ($found.Count -ne 1) {
+            "Candidates found: $($found.Count)"
+            $found | ForEach-Object { $_.FullName }
+            Get-ChildItem $root -Recurse -Depth 2 | Select-Object -First 80 FullName | Format-Table -AutoSize | Out-String -Width 300
+            throw "Expected exactly one Contents folder (with Info.plist and MacOS) - stopping"
+          }
+          $contents = $found[0].FullName
+          "CONTENTS_DIR=$contents" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "Contents folder: $contents"
+          Get-ChildItem $contents | Select-Object Mode, Name | Format-Table | Out-String
+
+          # Version check (README: only tested on 1.10.1). Warn only; the plist may be binary.
+          $plist = Get-Content (Join-Path $contents "Info.plist") -Raw -ErrorAction SilentlyContinue
+          if ($plist -match 'CFBundleShortVersionString</key>\s*<string>([^<]+)</string>') {
+            "CFBundleShortVersionString = $($Matches[1])"
+            if ($Matches[1] -ne "1.10.1") { "WARNING: README says only 1.10.1 was tested" }
+          } else { "Could not read the version from Info.plist (it may be a binary plist)" }
+
+      # ---------- Headless harness around the exe's own build engine ----------
+      - name: Compile the build harness
+        shell: pwsh
+        run: |
+          $tool = $env:PD_TOOL_DIR
+
+          $source = @'
+          using System;
+          using System.Collections;
+          using System.Globalization;
+          using System.IO;
+          using System.Reflection;
+          using System.Text;
+          using System.Threading;
+
+          // Runs Project_Dream.exe's build engine without its window. Calls exactly what the Build button calls.
+          internal static class PDHarness
+          {
+              private const BindingFlags Any = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+              private static readonly object Gate = new object();
+              private static DateTime lastPrint = DateTime.MinValue;
+              private static string lastKey = null;
+              private static string lastText = null;
+              private static int lastPct = -1;
+
+              private static int Main(string[] args)
+              {
+                  try
+                  {
+                      if (args.Length >= 2)
+                      {
+                          string exe = Path.GetFullPath(args[0]);
+                          string mode = args[1].ToLowerInvariant();
+                          if (mode == "selftest" && args.Length == 2) return SelfTest(exe);
+                          if (mode == "tools" && args.Length == 2) return Tools(exe);
+                          if (mode == "build" && args.Length == 5) return Build(exe, args[2].ToLowerInvariant(), args[3], args[4]);
+                      }
+                      Console.WriteLine("usage: PDHarness.exe <Project_Dream.exe> selftest");
+                      Console.WriteLine("       PDHarness.exe <Project_Dream.exe> tools");
+                      Console.WriteLine("       PDHarness.exe <Project_Dream.exe> build <android|windows> <Contents folder> <result file>");
+                      return 2;
+                  }
+                  catch (Exception ex)
+                  {
+                      Exception e = ex;
+                      while (e is TargetInvocationException && e.InnerException != null) e = e.InnerException;
+                      Console.WriteLine("::error title=Project Dream build failed::" + Escape(FirstLine(e.GetBaseException().Message)));
+                      Console.WriteLine("ERROR: " + Ascii(e.ToString()));
+                      return 1;
+                  }
+              }
+
+              // Same start-up as Program.Main in the exe (minus the window).
+              private static Assembly Prepare(string exe)
+              {
+                  if (!File.Exists(exe)) throw new FileNotFoundException("Project_Dream.exe not found: " + exe);
+                  AppContext.SetSwitch("Switch.System.IO.UseLegacyPathHandling", false);
+                  AppContext.SetSwitch("Switch.System.IO.BlockLongPaths", false);
+                  CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+                  CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+                  Environment.SetEnvironmentVariable("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1");
+                  Environment.SetEnvironmentVariable("JAVA_TOOL_OPTIONS", "-Duser.language=en -Duser.country=US");
+
+                  Assembly asm = Assembly.LoadFrom(exe);
+                  Type program = asm.GetType("ProjectDream.Program", true);
+                  MethodInfo resolve = program.GetMethod("ResolveLibrary", Any);
+                  if (resolve == null) throw new MissingMethodException("ProjectDream.Program.ResolveLibrary");
+                  AppDomain.CurrentDomain.AssemblyResolve += (ResolveEventHandler)Delegate.CreateDelegate(typeof(ResolveEventHandler), resolve);
+                  MethodInfo temp = program.GetMethod("UseLocalTemp", Any);
+                  if (temp == null) throw new MissingMethodException("ProjectDream.Program.UseLocalTemp");
+                  temp.Invoke(null, null);
+                  return asm;
+              }
+
+              private static void Require(bool ok, string what)
+              {
+                  if (!ok) throw new MissingMemberException("The exe does not match what this script expects: " + what);
+              }
+
+              private static object ReadDownloads(Assembly asm, Type tools)
+              {
+                  using (Stream s = asm.GetManifestResourceStream("Android/tool-downloads.json"))
+                  {
+                      if (s == null) throw new InvalidDataException("Android/tool-downloads.json is not embedded in the exe.");
+                      MethodInfo read = tools.GetMethod("Read", Any, null, new Type[] { typeof(Stream) }, null);
+                      return read.Invoke(null, new object[] { s });
+                  }
+              }
+
+              private static string Prop(object item, string name)
+              {
+                  object v = item.GetType().GetProperty(name).GetValue(item, null);
+                  return v == null ? "" : v.ToString();
+              }
+
+              private static void ListDownloads(object list)
+              {
+                  foreach (object item in (IEnumerable)list)
+                  {
+                      Console.WriteLine("  * " + Ascii(Prop(item, "Name")) + "  ->  " + Ascii(Prop(item, "Destination")));
+                      Console.WriteLine("      " + Ascii(Prop(item, "Url")));
+                      Console.WriteLine("      sha256 " + Ascii(Prop(item, "Sha256")));
+                  }
+              }
+
+              private static int SelfTest(string exe)
+              {
+                  Assembly asm = Prepare(exe);
+                  Type engine = asm.GetType("ProjectDream.Build.BuildEngine", true);
+                  Type progress = asm.GetType("ProjectDream.Build.BuildProgress", true);
+                  Type tools = asm.GetType("ProjectDream.Android.AndroidTools", true);
+                  Type download = asm.GetType("ProjectDream.Android.ToolDownload", true);
+
+                  Require(engine.GetProperty("CacheDirectory", Any) != null, "BuildEngine.CacheDirectory");
+                  Type actionOfProgress = typeof(Action<>).MakeGenericType(progress);
+                  Require(engine.GetConstructor(Any, null, new Type[] { actionOfProgress, typeof(CancellationToken) }, null) != null,
+                      "BuildEngine(Action<BuildProgress>, CancellationToken)");
+                  MethodInfo run = engine.GetMethod("Run", Any, null, new Type[] { typeof(string), typeof(bool) }, null);
+                  Require(run != null && run.ReturnType == typeof(string), "string BuildEngine.Run(string, bool)");
+                  Require(progress.GetField("Percent", Any) != null && progress.GetField("Text", Any) != null, "BuildProgress.Percent / Text");
+
+                  Require(tools.GetConstructor(Any, null, new Type[] { typeof(Action<int, string>), typeof(CancellationToken) }, null) != null,
+                      "AndroidTools(Action<int, string>, CancellationToken)");
+                  Type downloads = typeof(System.Collections.Generic.IEnumerable<>).MakeGenericType(download);
+                  Require(tools.GetMethod("Install", Any, null, new Type[] { typeof(string), typeof(string), downloads }, null) != null,
+                      "AndroidTools.Install(string, string, IEnumerable<ToolDownload>)");
+                  Require(tools.GetMethod("Read", Any, null, new Type[] { typeof(Stream) }, null) != null, "AndroidTools.Read(Stream)");
+
+                  object list = ReadDownloads(asm, tools);
+                  int count = 0;
+                  foreach (object item in (IEnumerable)list) count++;
+                  Require(count > 0, "a non-empty Android download list");
+
+                  Console.WriteLine("Self-test passed. Android dependencies embedded in this exe (" + count + "):");
+                  ListDownloads(list);
+                  return 0;
+              }
+
+              // Same as the first phase of the exe's Android build: install the NDK, SDK, JDK and Unity Android player.
+              private static int Tools(string exe)
+              {
+                  Assembly asm = Prepare(exe);
+                  Type engine = asm.GetType("ProjectDream.Build.BuildEngine", true);
+                  Type tools = asm.GetType("ProjectDream.Android.AndroidTools", true);
+
+                  string cache = (string)engine.GetProperty("CacheDirectory", Any).GetValue(null, null);
+                  string exeDir = Path.GetDirectoryName(asm.Location);
+                  string toolsDir = Path.Combine(exeDir, "AndroidTools");
+                  string downloadsDir = Path.Combine(cache, "AndroidDownloads");
+
+                  object list = ReadDownloads(asm, tools);
+                  Console.WriteLine("Installing into " + toolsDir);
+                  ListDownloads(list);
+
+                  Action<int, string> report = delegate (int p, string t) { Print(p, t); };
+                  object installer = Activator.CreateInstance(tools, Any, null, new object[] { report, CancellationToken.None }, null);
+                  MethodInfo install = null;
+                  foreach (MethodInfo m in tools.GetMethods(Any))
+                  {
+                      if (m.Name == "Install") install = m;
+                  }
+                  if (install == null) throw new MissingMethodException("ProjectDream.Android.AndroidTools.Install");
+                  install.Invoke(installer, new object[] { toolsDir, downloadsDir, list });
+                  Console.WriteLine("Android dependencies installed.");
+                  return 0;
+              }
+
+              private static int Build(string exe, string platform, string contents, string resultFile)
+              {
+                  bool android;
+                  if (platform == "android") android = true;
+                  else if (platform == "windows") android = false;
+                  else { Console.WriteLine("platform must be android or windows"); return 2; }
+
+                  Assembly asm = Prepare(exe);
+                  Type engineType = asm.GetType("ProjectDream.Build.BuildEngine", true);
+                  Type progressType = asm.GetType("ProjectDream.Build.BuildProgress", true);
+
+                  // Action<BuildProgress> is built through a generic helper because BuildProgress is internal to the exe.
+                  Type actionType = typeof(Action<>).MakeGenericType(progressType);
+                  MethodInfo helper = typeof(PDHarness).GetMethod("OnProgress", BindingFlags.NonPublic | BindingFlags.Static).MakeGenericMethod(progressType);
+                  Delegate progress = Delegate.CreateDelegate(actionType, helper);
+
+                  object engine = Activator.CreateInstance(engineType, Any, null, new object[] { progress, CancellationToken.None }, null);
+                  MethodInfo run = engineType.GetMethod("Run", Any, null, new Type[] { typeof(string), typeof(bool) }, null);
+                  if (run == null) throw new MissingMethodException("ProjectDream.Build.BuildEngine.Run(string, bool)");
+
+                  Console.WriteLine("Building " + platform + " from " + Ascii(contents));
+                  DateTime started = DateTime.UtcNow;
+                  string output = (string)run.Invoke(engine, new object[] { contents, android });
+                  if (string.IsNullOrEmpty(output)) throw new InvalidDataException("The build returned no output folder.");
+                  File.WriteAllText(resultFile, output);
+                  Console.WriteLine("Build finished in " + ((int)(DateTime.UtcNow - started).TotalSeconds) + " s. Output folder: " + Ascii(output));
+                  return 0;
+              }
+
+              private static void OnProgress<T>(T value)
+              {
+                  Type t = typeof(T);
+                  int pct = (int)t.GetField("Percent", Any).GetValue(value);
+                  string text = (string)t.GetField("Text", Any).GetValue(value);
+                  Print(pct, text);
+              }
+
+              // Progress lines: a new kind of step prints at once; repeated progress of the same step at most every 2 s.
+              private static void Print(int pct, string text)
+              {
+                  if (text == null) text = "";
+                  lock (Gate)
+                  {
+                      if (pct == lastPct && text == lastText) return;
+                      string key = text;
+                      int cut = text.IndexOf(':');
+                      if (cut < 0) cut = text.IndexOf('\u2014');
+                      if (cut > 0) key = text.Substring(0, cut);
+                      DateTime now = DateTime.UtcNow;
+                      if (key == lastKey && pct < 100 && (now - lastPrint).TotalSeconds < 2.0) return;
+                      lastKey = key;
+                      lastText = text;
+                      lastPct = pct;
+                      lastPrint = now;
+                      Console.WriteLine("[" + pct.ToString(CultureInfo.InvariantCulture).PadLeft(3) + "%] " + Ascii(text));
+                  }
+              }
+
+              private static string Ascii(string s)
+              {
+                  if (s == null) return "";
+                  StringBuilder sb = new StringBuilder(s.Length);
+                  foreach (char c in s)
+                  {
+                      if (c == '\u2014' || c == '\u2013') sb.Append('-');
+                      else if (c == '\r' || c == '\n' || c == '\t' || (c >= 32 && c <= 126)) sb.Append(c);
+                      else sb.Append('?');
+                  }
+                  return sb.ToString();
+              }
+
+              private static string FirstLine(string s)
+              {
+                  if (s == null) return "";
+                  int i = s.IndexOf('\n');
+                  return i >= 0 ? s.Substring(0, i).TrimEnd('\r') : s;
+              }
+
+              private static string Escape(string s)
+              {
+                  return Ascii(s).Replace("%", "%25").Replace("\r", "%0D").Replace("\n", "%0A");
+              }
+          }
+          '@
+
+          $manifest = @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+            <assemblyIdentity version="1.0.0.0" name="PDHarness.app" />
+            <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false" /></requestedPrivileges></security></trustInfo>
+            <application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>
+              <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+            </windowsSettings></application>
+          </assembly>
+          '@
+
+          $config = @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <startup>
+              <supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.8" />
+            </startup>
+            <runtime>
+              <AppContextSwitchOverrides value="Switch.System.IO.UseLegacyPathHandling=false;Switch.System.IO.BlockLongPaths=false" />
+            </runtime>
+          </configuration>
+          '@
+
+          Set-Content -Path "$tool\PDHarness.cs" -Value $source -Encoding ascii
+          Set-Content -Path "$tool\PDHarness.manifest" -Value $manifest -Encoding ascii
+          Set-Content -Path "$tool\PDHarness.exe.config" -Value $config -Encoding ascii
+
+          # The .NET Framework 4.x compiler that ships with Windows (C# 5), 64-bit like the exe.
+          $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
+          & $csc /nologo /target:exe /platform:x64 /optimize+ "/win32manifest:$tool\PDHarness.manifest" "/out:$tool\PDHarness.exe" "$tool\PDHarness.cs" 2>&1 | Tee-Object -FilePath logs/05-harness-compile.txt
+          if ($LASTEXITCODE -ne 0) { throw "Compiling the harness failed (exit code $LASTEXITCODE). See logs/05-harness-compile.txt" }
+          if (-not (Test-Path "$tool\PDHarness.exe")) { throw "PDHarness.exe was not produced" }
+          "Harness compiled: $tool\PDHarness.exe" | Tee-Object -FilePath logs/05-harness-compile.txt -Append
+
+      # Fails in seconds (before any download) if the exe's internals are not what the harness expects.
+      - name: Self-test the harness against the exe
+        shell: pwsh
+        run: |
+          & "$env:PD_TOOL_DIR\PDHarness.exe" "$env:PD_TOOL_DIR\Project_Dream.exe" selftest 2>&1 | Tee-Object -FilePath logs/06-selftest.txt
+          if ($LASTEXITCODE -ne 0) { throw "Harness self-test failed (exit code $LASTEXITCODE). See logs/06-selftest.txt" }
+
+      # ---------- Android only: signing key ----------
+      - name: Android signing key - restore from cache
+        if: inputs.platform == 'android' && env.HAS_KEYSTORE_SECRET != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\signing
+          key: sdt-android-keystore-v1
+
+      - name: Android signing key - point the exe at it
+        if: inputs.platform == 'android'
+        shell: pwsh
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          $dir = Join-Path $env:GITHUB_WORKSPACE "signing"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $ks = Join-Path $dir "sdt-android.keystore"
+          if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_KEYSTORE_BASE64)) {
+            [System.IO.File]::WriteAllBytes($ks, [System.Convert]::FromBase64String($env:ANDROID_KEYSTORE_BASE64.Trim()))
+            "Using the keystore from secret ANDROID_KEYSTORE_BASE64 (alias must be 'sdt', passwords 'sdtandroid')."
+          } elseif (Test-Path $ks) {
+            "Reusing the signing key from the Actions cache."
+          } else {
+            "No signing key yet. The build creates one and it is cached for the next run."
+          }
+          # android-tools.json next to the exe tells it where the keystore is (the exe reads it on every Android build).
+          $json = @{ keystore = $ks } | ConvertTo-Json -Compress
+          Set-Content -Path (Join-Path $env:PD_TOOL_DIR "android-tools.json") -Value $json -Encoding ascii
+          "android-tools.json: $json"
+
+      # ---------- Android only: dependencies (NDK, SDK, JDK, Unity Android player) ----------
+      - name: Fetch Android dependencies (NDK, SDK, JDK, Unity Android player)
+        if: inputs.platform == 'android'
+        shell: pwsh
+        run: |
+          & "$env:PD_TOOL_DIR\PDHarness.exe" "$env:PD_TOOL_DIR\Project_Dream.exe" tools 2>&1 | Tee-Object -FilePath logs/07-android-tools.txt
+          if ($LASTEXITCODE -ne 0) { throw "Fetching the Android dependencies failed (exit code $LASTEXITCODE). See logs/07-android-tools.txt" }
+
+      - name: Verify Android dependencies
+        if: inputs.platform == 'android'
+        shell: pwsh
+        run: |
+          $t = Join-Path $env:PD_TOOL_DIR "AndroidTools"
+          $jdk = Get-ChildItem (Join-Path $t "toolchain") -Directory -Filter "jdk-17*" | Sort-Object Name | Select-Object -First 1
+          if (-not $jdk) { throw "OpenJDK 17 was not installed under $t\toolchain" }
+          $required = @(
+            (Join-Path $t "toolchain\android-ndk-r23b\toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe"),
+            (Join-Path $jdk.FullName "bin\javac.exe"),
+            (Join-Path $jdk.FullName "bin\java.exe"),
+            (Join-Path $jdk.FullName "bin\keytool.exe"),
+            (Join-Path $t "toolchain\sdk\platforms\android-34\android.jar"),
+            (Join-Path $t "toolchain\sdk\build-tools\34.0.0\aapt2.exe"),
+            (Join-Path $t "toolchain\sdk\build-tools\34.0.0\lib\apksigner.jar"),
+            (Join-Path $t "Unity\Editor\Data\PlaybackEngines\AndroidPlayer\Variations\il2cpp\Release\Libs\arm64-v8a\libunity.so")
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          $required | ForEach-Object { "{0}  {1}" -f $(if (Test-Path $_) { "ok     " } else { "MISSING" }), $_ } | Tee-Object -FilePath logs/08-android-verify.txt
+          if ($missing) { throw "Missing Android build dependencies (listed above)" }
+
+          # Informational: the tools start. A failure here is only logged; the build itself is the real test.
+          try { & (Join-Path $jdk.FullName "bin\java.exe") -version 2>&1 | Tee-Object -FilePath logs/08-android-verify.txt -Append } catch { "java -version: $($_.Exception.Message)" | Tee-Object -FilePath logs/08-android-verify.txt -Append }
+          try { & $required[0] --version 2>&1 | Select-Object -First 2 | Tee-Object -FilePath logs/08-android-verify.txt -Append } catch { "clang --version: $($_.Exception.Message)" | Tee-Object -FilePath logs/08-android-verify.txt -Append }
+
+          # The downloaded archives are not needed again; free the space for the asset conversion and packing.
+          $dl = Join-Path $env:PD_TOOL_DIR "Cache\AndroidDownloads"
+          if (Test-Path $dl) { Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue }
+          Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | ForEach-Object { "{0}: free {1:N1} GB" -f $_.Name, ($_.Free / 1GB) }
+
+
+      # ---------- Build (the platform switch) ----------
+      - name: Build ${{ inputs.platform }}
+        shell: pwsh
+        run: |
+          $resultFile = Join-Path $env:RUNNER_TEMP "pd-output-folder.txt"
+          if (Test-Path $resultFile) { Remove-Item $resultFile -Force }
+          "Contents folder: $env:CONTENTS_DIR"
+          if ([string]::IsNullOrWhiteSpace($env:CONTENTS_DIR) -or -not (Test-Path $env:CONTENTS_DIR)) { throw "CONTENTS_DIR is not set or does not exist" }
+          & "$env:PD_TOOL_DIR\PDHarness.exe" "$env:PD_TOOL_DIR\Project_Dream.exe" build $env:PD_PLATFORM $env:CONTENTS_DIR $resultFile 2>&1 | Tee-Object -FilePath "logs/09-build-$($env:PD_PLATFORM).txt"
+          if ($LASTEXITCODE -ne 0) { throw "The $($env:PD_PLATFORM) build failed (exit code $LASTEXITCODE). See logs/09-build-$($env:PD_PLATFORM).txt" }
+          if (-not (Test-Path $resultFile)) { throw "The build did not report an output folder" }
+          $out = (Get-Content $resultFile -Raw).Trim()
+          if (-not (Test-Path $out)) { throw "Output folder does not exist: $out" }
+          "PD_OUTPUT_DIR=$out" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "Output folder: $out"
+
+      - name: Verify the Android output
+        if: inputs.platform == 'android'
+        shell: pwsh
+        run: |
+          $out = $env:PD_OUTPUT_DIR
+          $apk = Join-Path $out "SonicDreamTeam.apk"
+          $obb = Join-Path $out "main.1.com.sonicdreamteam.android.obb"
+          foreach ($f in $apk, $obb, (Join-Path $out "INSTALL.txt")) {
+            if (-not (Test-Path $f)) { throw "Missing build output: $f" }
+            "{0,-45} {1,10:N1} MB" -f (Split-Path $f -Leaf), ((Get-Item $f).Length / 1MB)
+          }
+          if ((Get-Item $apk).Length -lt 1MB) { throw "SonicDreamTeam.apk is implausibly small" }
+          if ((Get-Item $obb).Length -lt 1MB) { throw "The OBB is implausibly small" }
+
+          # The exe already signed the APK and ran apksigner verify. This checks the pieces a playable APK needs.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($apk)
+          try { $names = @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
+          "APK entries: $($names.Count)"
+          foreach ($need in "AndroidManifest.xml", "classes.dex", "lib/arm64-v8a/libmain.so", "lib/arm64-v8a/libunity.so", "lib/arm64-v8a/libil2cpp.so") {
+            if ($names -notcontains $need) { throw "The APK is missing $need" }
+            "ok  $need"
+          }
+          "INSTALL.txt says: " + (Get-Content (Join-Path $out "INSTALL.txt") -Raw).Trim()
+
+      - name: Verify the Windows output
+        if: inputs.platform == 'windows'
+        shell: pwsh
+        run: |
+          $out = $env:PD_OUTPUT_DIR
+          foreach ($need in "ProjectDream.exe", "GameAssembly.dll", "ProjectDream_Data") {
+            if (-not (Test-Path (Join-Path $out $need))) { throw "The Windows build is missing $need" }
+            "ok  $need"
+          }
+          $size = (Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+          "Output size: {0:N1} MB" -f ($size / 1MB)
+          Get-ChildItem $out | Select-Object Mode, Name | Format-Table | Out-String
+
+      # ---------- Publish ----------
+      - name: Upload Android build (APK + OBB)
+        if: inputs.platform == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Project-Dream-Android
+          path: |
+            ${{ env.PD_OUTPUT_DIR }}\SonicDreamTeam.apk
+            ${{ env.PD_OUTPUT_DIR }}\main.1.com.sonicdreamteam.android.obb
+            ${{ env.PD_OUTPUT_DIR }}\INSTALL.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Upload Windows build
+        if: inputs.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Project-Dream-Windows
+          path: ${{ env.PD_OUTPUT_DIR }}
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $lines = @("## Project Dream build: $env:PD_PLATFORM", "")
+          if ($env:PD_PLATFORM -eq "android") {
+            $lines += "Download the **Project-Dream-Android** artifact, then:"
+            $lines += "1. Install ``SonicDreamTeam.apk`` on the phone (arm64, Android 8.0+)."
+            $lines += "2. Copy ``main.1.com.sonicdreamteam.android.obb`` to ``Android/obb/com.sonicdreamteam.android/`` on the phone (INSTALL.txt has the path)."
+            $lines += "3. Start the game."
+          } else {
+            $lines += "Download the **Project-Dream-Windows** artifact and run ``ProjectDream.exe``."
+          }
+          $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ inputs.platform }}
+          path: logs
+          if-no-files-found: warn
