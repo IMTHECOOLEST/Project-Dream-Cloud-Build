@@ -79,8 +79,17 @@ jobs:
 
           if (Test-IsContents $root) { $found = @(Get-Item $root) }
           else {
-            $found = @(Get-ChildItem $root -Recurse -Directory -Filter Contents |
+            $all = @(Get-ChildItem $root -Recurse -Directory -Filter Contents |
               Where-Object { $_.FullName -notmatch '__MACOSX' -and (Test-IsContents $_.FullName) })
+
+            # Unity plugin bundles (PlugIns\*.bundle) and any helper apps have their own Contents folder with
+            # Info.plist + MacOS, so they look like candidates too. That is what broke the previous run
+            # (more than one match). Keep only the outermost: drop any candidate that sits inside another one.
+            $found = @($all | Where-Object {
+              $p = $_.FullName
+              -not ($all | Where-Object { $_.FullName -ne $p -and $p.StartsWith($_.FullName + '\', [System.StringComparison]::OrdinalIgnoreCase) })
+            })
+            "All Contents-like folders: $($all.Count); outermost: $($found.Count)"
           }
           if ($found.Count -ne 1) {
             "Candidates found: $($found.Count)"
