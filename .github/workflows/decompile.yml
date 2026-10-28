@@ -1,0 +1,136 @@
+name: Project Dream - reassemble and decompile
+
+# Steps 1-3 only: reassemble the split zip, verify the hash, check prereqs,
+# decompile with ilspycmd, and print what it finds. Nothing here modifies the exe.
+# Run it from the Actions tab > "Project Dream - reassemble and decompile" > Run workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  decompile:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner info
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force logs | Out-Null
+          (Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, FreePhysicalMemory | Format-List | Out-String) | Tee-Object -FilePath logs/00-runner.txt
+          dotnet --list-sdks | Tee-Object -FilePath logs/00-runner.txt -Append
+
+      # ---------- STEP 1: REASSEMBLE ----------
+      - name: Install Info-ZIP
+        shell: pwsh
+        run: choco install zip -y 2>&1 | Tee-Object -FilePath logs/01-choco-zip.txt
+
+      - name: Reassemble split zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force work | Out-Null
+          Get-ChildItem ezyZip.* | Select-Object Name, Length | Format-Table | Out-String | Tee-Object -FilePath logs/02-parts.txt
+          Copy-Item ezyZip.z0*, ezyZip.zip work/
+          Set-Location work
+          zip -s 0 ezyZip.zip --out EzyZip_combined.zip 2>&1 | Tee-Object -FilePath ../logs/02-combine.txt -Append
+          if ($LASTEXITCODE -ne 0) { throw "zip -s 0 failed with exit code $LASTEXITCODE" }
+          Expand-Archive EzyZip_combined.zip -DestinationPath combined -Force
+          Get-ChildItem combined -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize | Out-String -Width 300 | Tee-Object -FilePath ../logs/02-combine.txt -Append
+          Expand-Archive "combined/untitled folder.zip" -DestinationPath inner -Force
+          Get-ChildItem inner -Recurse -File | Where-Object { $_.FullName -notmatch '__MACOSX' } | Select-Object FullName, Length | Format-Table -AutoSize | Out-String -Width 300 | Tee-Object -FilePath ../logs/02-combine.txt -Append
+
+      - name: Verify SHA-256 of Project_Dream.exe
+        shell: pwsh
+        run: |
+          $expected = "b2947bd61e86b067e7264888d64dd704972e901210f42c6bc7a0c5260a070101"
+          $exe = "work/inner/untitled folder/Project_Dream.exe"
+          $item = Get-Item $exe
+          $actual = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "size:     $($item.Length) bytes (expected 80336384)" | Tee-Object -FilePath logs/03-hash.txt
+          "expected: $expected" | Tee-Object -FilePath logs/03-hash.txt -Append
+          "actual:   $actual" | Tee-Object -FilePath logs/03-hash.txt -Append
+          if ($actual -ne $expected) { throw "SHA-256 MISMATCH - stopping" }
+          "HASH OK" | Tee-Object -FilePath logs/03-hash.txt -Append
+
+      # ---------- STEP 2: PREREQS ----------
+      - name: Check .NET Framework 4.8 (registry Release >= 528040)
+        shell: pwsh
+        run: |
+          $rel = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full').Release
+          "Release value: $rel (need >= 528040)" | Tee-Object -FilePath logs/04-netfx48.txt
+          if ($rel -lt 528040) { throw ".NET Framework 4.8 not present - stopping" }
+          ".NET Framework 4.8 present" | Tee-Object -FilePath logs/04-netfx48.txt -Append
+
+      - name: Enable .NET 3.5 (covers 2.0/3.0)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # Not needed for the decompile itself. If DISM fails the run continues and the failure is in the log.
+          DISM /Online /Enable-Feature /FeatureName:NetFx3 /All 2>&1 | Tee-Object -FilePath logs/05-netfx3.txt
+          "DISM exit code: $LASTEXITCODE" | Tee-Object -FilePath logs/05-netfx3.txt -Append
+          if ($LASTEXITCODE -ne 0) { throw "DISM NetFx3 failed (see log)" }
+
+      - name: Install ilspycmd
+        shell: pwsh
+        run: |
+          dotnet tool install -g ilspycmd 2>&1 | Tee-Object -FilePath logs/06-ilspycmd-install.txt
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & "$env:USERPROFILE\.dotnet\tools\ilspycmd.exe" --version 2>&1 | Tee-Object -FilePath logs/06-ilspycmd-install.txt -Append
+
+      # ---------- STEP 4 (partial): can the runner reach the download hosts? ----------
+      - name: Network reachability check
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $hosts = "https://dl.google.com", "https://github.com", "https://download.unity3d.com", "https://builds.dotnet.microsoft.com"
+          foreach ($h in $hosts) {
+            try {
+              $r = Invoke-WebRequest -Uri $h -Method Head -TimeoutSec 20 -UseBasicParsing -MaximumRedirection 5
+              "$h -> HTTP $($r.StatusCode)" | Tee-Object -FilePath logs/07-network.txt -Append
+            } catch {
+              "$h -> $($_.Exception.Message)" | Tee-Object -FilePath logs/07-network.txt -Append
+            }
+          }
+
+      # ---------- STEP 3: DECOMPILE ----------
+      - name: Decompile with ilspycmd
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force decomp | Out-Null
+          Copy-Item "work/inner/untitled folder/Project_Dream.exe" decomp/
+          Set-Location decomp
+          ilspycmd -p -o src Project_Dream.exe 2>&1 | Tee-Object -FilePath ../logs/08-decompile.txt
+          "ilspycmd exit code: $LASTEXITCODE" | Tee-Object -FilePath ../logs/08-decompile.txt -Append
+          if ($LASTEXITCODE -ne 0) { throw "ilspycmd failed" }
+
+      - name: Report what the decompile contains
+        shell: pwsh
+        run: |
+          Set-Location decomp
+          "=== file tree (top 300) ===" | Tee-Object -FilePath ../logs/09-findings.txt
+          Get-ChildItem src -Recurse -File | Select-Object -First 300 | ForEach-Object { "{0,12}  {1}" -f $_.Length, $_.FullName.Substring((Get-Location).Path.Length) } | Tee-Object -FilePath ../logs/09-findings.txt -Append
+
+          "`n=== entry point / CLI / BuildClicked references ===" | Tee-Object -FilePath ../logs/09-findings.txt -Append
+          Get-ChildItem src -Recurse -Filter *.cs | Select-String -Pattern 'BuildClicked|static (void|int|async Task|async Task<int>) Main|Application\.Run|GetCommandLineArgs|string\[\] args' | ForEach-Object { "$($_.Path.Substring((Get-Location).Path.Length)):$($_.LineNumber): $($_.Line.Trim())" } | Tee-Object -FilePath ../logs/09-findings.txt -Append
+
+          "`n=== tool-downloads.json (authoritative download list) ===" | Tee-Object -FilePath ../logs/09-findings.txt -Append
+          $json = Get-ChildItem src -Recurse -Filter tool-downloads.json
+          if ($json) { foreach ($j in $json) { "--- $($j.FullName)" | Tee-Object -FilePath ../logs/09-findings.txt -Append; Get-Content $j.FullName -Raw | Tee-Object -FilePath ../logs/09-findings.txt -Append } }
+          else { "tool-downloads.json NOT FOUND in decompiled output" | Tee-Object -FilePath ../logs/09-findings.txt -Append }
+
+      - name: Defender detections (report only, security tools are left on)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $d = Get-MpThreatDetection -ErrorAction SilentlyContinue
+          if ($d) { $d | Format-List | Out-String | Tee-Object -FilePath logs/10-defender.txt } else { "No Defender detections reported" | Tee-Object -FilePath logs/10-defender.txt }
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompile-results
+          path: |
+            decomp/src
+            logs
+          if-no-files-found: warn
