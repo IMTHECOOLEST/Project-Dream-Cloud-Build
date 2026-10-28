@@ -28,9 +28,11 @@ jobs:
           $zip = Join-Path $PWD "contents.zip"
 
           # Free space on the workspace drive before downloading.
-          $drive = (Get-Item $PWD).PSDriveName
-          $free = (Get-PSDrive $drive).Free
-          "Workspace drive ${drive}: free = $([math]::Round($free/1GB,2)) GB"
+          # (Get-Item $PWD).PSDriveName is always null (that property doesn't exist), which is what broke
+          # the previous run. DriveInfo on the path root doesn't depend on PowerShell drives at all.
+          $driveRoot = [System.IO.Path]::GetPathRoot($PWD.Path)
+          $free = [System.IO.DriveInfo]::new($driveRoot).AvailableFreeSpace
+          "Workspace drive ${driveRoot} free = $([math]::Round($free/1GB,2)) GB"
 
           curl.exe -L --fail --retry 5 --retry-delay 10 --silent --show-error -o $zip $env:CONTENTS_URL
           if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE (link not direct, expired, or blocked)" }
